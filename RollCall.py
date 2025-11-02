@@ -3,12 +3,16 @@ import random
 import json
 import os
 import webbrowser
-from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QUrl
+import urllib.request
+import urllib.error
+import zipfile
+import threading
+from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QUrl, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QPalette, QColor, QFont, QFontDatabase, QPixmap
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QStackedWidget, QFrame, QLabel, QFileDialog, QListWidgetItem,
                              QSpacerItem, QSizePolicy, QGraphicsDropShadowEffect,
-                             QGraphicsOpacityEffect)
+                             QGraphicsOpacityEffect, QProgressDialog)
 
 # Multimedia imports for sound playback (mp3)
 try:
@@ -17,16 +21,23 @@ except Exception:
     QMediaPlayer = None
     QMediaContent = None
 
-from qfluentwidgets import (NavigationInterface, NavigationItemPosition, NavigationWidget, MessageBox,
+from qfluentwidgets import (NavigationInterface, NavigationItemPosition, NavigationWidget, MessageBox, InfoBar, InfoBarIcon,
                             isDarkTheme, setTheme, Theme, setThemeColor, FluentWindow,
-                            PrimaryPushButton, InfoBar, InfoBarPosition, ScrollArea,
+                            PrimaryPushButton, InfoBarPosition, ScrollArea,
                             ComboBox, CheckBox, PushButton, LineEdit, ListWidget,
                             BodyLabel, TitleLabel, DisplayLabel, CaptionLabel,
                             TeachingTip, TeachingTipTailPosition, Dialog, FluentIcon,
                             SegmentedWidget, CardWidget, setFont, TransparentToolButton,
                             ExpandSettingCard, SettingCardGroup, HyperlinkCard,
-                            ColorDialog, setCustomStyleSheet, InfoBarIcon, IconWidget,
-                            SwitchButton, SettingCard)
+                            ColorDialog, setCustomStyleSheet,
+                            SwitchButton, SettingCard, Dialog, MessageBoxBase, IconWidget)
+
+
+class DownloadSignals(QObject):
+    """下载信号类，用于线程间通信"""
+    progress_updated = pyqtSignal(int, int)  # 当前下载量, 总大小
+    download_finished = pyqtSignal()
+    error_occurred = pyqtSignal(str)
 
 
 class NameListManager:
@@ -105,10 +116,20 @@ class NameListManager:
 
         if available_names:
             name = random.choice(available_names)
-            if avoid_repetition:
-                self.used_names.add(name)
             return name
         return None
+
+    def mark_name_as_used(self, name, avoid_repetition=True):
+        """将名字标记为已使用"""
+        if avoid_repetition and name:
+            self.used_names.add(name)
+
+    def check_and_reset_if_complete(self, avoid_repetition=True):
+        """检查是否所有名字都已被点过，如果是则重置并返回True"""
+        if avoid_repetition and len(self.used_names) >= len(self.names) and len(self.names) > 0:
+            self.reset_used_names()
+            return True
+        return False
 
 
 class Settings:
@@ -116,7 +137,9 @@ class Settings:
     def __init__(self):
         self.auto_save = True
         self.avoid_repetition = True
+        self.check_update_on_startup = False  # 新增：启动时检查更新
         self.theme = Theme.AUTO
+        self.version = "3.3.3"  # 当前版本
 
     def load_from_file(self, filename):
         """从文件加载设置"""
@@ -126,8 +149,10 @@ class Settings:
                     data = json.load(f)
                     self.auto_save = data.get('auto_save', True)
                     self.avoid_repetition = data.get('avoid_repetition', True)
+                    self.check_update_on_startup = data.get('check_update_on_startup', False)
                     theme_str = data.get('theme', 'AUTO')
                     self.theme = getattr(Theme, theme_str, Theme.AUTO)
+                    self.version = data.get('version', "3.3.3")  # 加载版本
                 return True
             return False
         except Exception:
@@ -140,7 +165,9 @@ class Settings:
             data = {
                 'auto_save': self.auto_save,
                 'avoid_repetition': self.avoid_repetition,
+                'check_update_on_startup': self.check_update_on_startup,
                 'theme': self.theme.name,
+                'version': self.version  # 保存版本
             }
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -152,7 +179,9 @@ class Settings:
         """重置设置为默认值"""
         self.auto_save = True
         self.avoid_repetition = True
+        self.check_update_on_startup = False
         self.theme = Theme.AUTO
+        self.version = "3.3.3"  # 重置版本
 
 
 class MainWindow(FluentWindow):
@@ -188,7 +217,7 @@ class MainWindow(FluentWindow):
         # UI 先构建（主题已提前应用，避免闪烁）
         self.setup_ui()
 
-        # 延迟完成启动工作（加载字体、图标、名单等），以保持启动快速响应
+        # 延迟完成启动工作（加载字体、图标、配置和名册，并应用设置）
         QTimer.singleShot(0, self.finish_startup)
 
     def finish_startup(self):
@@ -215,6 +244,39 @@ class MainWindow(FluentWindow):
         self.load_data()
         # Re-apply settings to ensure all UI reflects current settings values
         self.apply_settings()
+        
+        # 检查版本更新
+        self.check_version_update()
+
+        # 新增：启动时自动检查更新（静默，只在不是最新且联网正常时弹出对话框）
+        if getattr(self.settings, 'check_update_on_startup', False):
+            if hasattr(self, 'settings_interface'):
+                QTimer.singleShot(400, self.settings_interface.silent_check_updates_on_startup)
+
+    def check_version_update(self):
+        """检查版本更新并显示更新对话框"""
+        current_version = "3.3.3"  # 当前程序版本
+        saved_version = self.settings.version  # 配置文件中保存的版本
+        
+        if saved_version != current_version:
+            # 显示更新对话框
+            self.show_update_dialog(saved_version, current_version)
+            
+            # 更新配置文件中的版本
+            self.settings.version = current_version
+            self.save_settings()
+
+    def show_update_dialog(self, old_version, new_version):
+        """显示更新对话框 - 使用带遮罩的对话框样式"""
+        title = f"已更新到 {new_version}"
+        content = "新版本内容：\n · 更新后展示更新内容对话框\n · 添加自动更新功能\n · 支持启动时自动检查更新"
+        
+        # 使用 MessageBox 创建带遮罩的对话框
+        w = MessageBox(title, content, self)
+        # 修改按钮文字为中文
+        w.yesButton.setText('确定')
+        w.cancelButton.setVisible(False)  # 隐藏取消按钮，只显示确定按钮
+        w.exec()
 
     def load_custom_font(self):
         """加载自定义字体（延迟执行以减少启动阻塞）"""
@@ -514,10 +576,14 @@ class RollCallInterface(QWidget):
         super().__init__(parent)
         self.name_manager = parent.name_manager if parent else NameListManager()
         self.settings = parent.settings if parent else Settings()
+        self.parent_window = parent
         self.font_family = font_family
         self.is_rolling = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_name)
+        
+        # 用于记录最后选中的名字
+        self.last_selected_name = None
 
         self.setObjectName("RollCallInterface")
         self.setup_ui()
@@ -693,17 +759,30 @@ class RollCallInterface(QWidget):
         self.is_rolling = False
         self.update_button_styles()
         self.timer.stop()
+        
+        # 只有在停止点名时才将最后显示的名字标记为已使用
+        if self.last_selected_name and self.settings.avoid_repetition:
+            self.name_manager.mark_name_as_used(self.last_selected_name, self.settings.avoid_repetition)
+            # 保存名单状态
+            QTimer.singleShot(0, self.parent_window.save_name_list)
+            
+            # 检查是否所有名字都已被点过
+            if self.name_manager.check_and_reset_if_complete(self.settings.avoid_repetition):
+                # 所有名字都点过了，重置并显示提示
+                self.name_display.setText("名单已重载")
+                # 保存重置后的状态
+                QTimer.singleShot(0, self.parent_window.save_name_list)
 
     def update_name(self):
         """更新显示的名字"""
         name = self.name_manager.get_random_name(self.settings.avoid_repetition)
         if name:
             self.name_display.setText(name)
+            self.last_selected_name = name
         else:
-            # 当所有名字都已被点过时，自动重置并显示提示
-            self.name_manager.reset_used_names()
+            # 当没有可用名字时，显示准备点名
             self.name_display.setText("准备点名")
-            self.show_reload_notification("名单已重载")
+            self.last_selected_name = None
 
     def reload_names(self):
         """重新加载名单"""
@@ -712,9 +791,13 @@ class RollCallInterface(QWidget):
 
         self.name_manager.reset_used_names()
         self.name_display.setText("准备点名")
+        self.last_selected_name = None
 
         # 显示重新加载成功的消息条
         self.show_reload_notification("名单已重载")
+        
+        # 保存重置后的状态
+        QTimer.singleShot(0, self.parent_window.save_name_list)
 
     def show_reload_notification(self, message):
         """显示重新加载通知"""
@@ -897,6 +980,7 @@ class TimerInterface(QWidget):
     def update_digit_styles(self):
         """根据主题更新数字、按钮、冒号样式"""
         is_dark = isDarkTheme()
+
         title_color = "#6c8fff" if is_dark else "#4a6bff"
         digit_color = "white" if is_dark else "black"
         # plus/minus color - 使用与点名按钮边框一致的颜色，让它们在深浅色下都可见
@@ -959,19 +1043,24 @@ class TimerInterface(QWidget):
             }
         """
         start_style = acrylic_style % ("PrimaryPushButton", "PrimaryPushButton", "PrimaryPushButton") + """
-            PrimaryPushButton { color: #4caf50; }
+            PrimaryPushButton {
+                color: #4caf50;
+            }
         """
-        pause_style = acrylic_style % ("PrimaryPushButton", "PrimaryPushButton", "PrimaryPushButton") + """
-            PrimaryPushButton { color: #d13438; }
+        stop_style = acrylic_style % ("PrimaryPushButton", "PrimaryPushButton", "PrimaryPushButton") + """
+            PrimaryPushButton {
+                color: #d13438;
+            }
         """
-        # reset 使用与 reload 相同的黄色
         reset_style = acrylic_style % ("PushButton", "PushButton", "PushButton") + """
-            PushButton { color: #ff9800; }
+            PushButton {
+                color: #ff9800;
+            }
         """
 
         if self.is_running:
             self.start_button.setText("暂停计时")
-            self.start_button.setStyleSheet(pause_style)
+            self.start_button.setStyleSheet(stop_style)
         else:
             self.start_button.setText("开始计时")
             self.start_button.setStyleSheet(start_style)
@@ -979,96 +1068,65 @@ class TimerInterface(QWidget):
         self.reset_button.setStyleSheet(reset_style)
 
     def update_button_styles(self):
-        """更新开始/重置按钮风格（参照点名界面）"""
-        # 代理到 update_digit_styles 做统一更新（保持样式一致）
+        """更新按钮样式（与 update_digit_styles 合并）"""
         self.update_digit_styles()
 
+    def _digits_to_seconds(self, digits):
+        """将 digits 数组转换为总秒数"""
+        h = digits[0] * 10 + digits[1]
+        m = digits[2] * 10 + digits[3]
+        s = digits[4] * 10 + digits[5]
+        return h * 3600 + m * 60 + s
+
+    def _seconds_to_digits(self, seconds):
+        """将总秒数转换为 digits 数组"""
+        seconds = max(0, seconds)
+        h = seconds // 3600
+        seconds %= 3600
+        m = seconds // 60
+        s = seconds % 60
+        return [h // 10, h % 10, m // 10, m % 10, s // 10, s % 10]
+
+    def update_digit_display(self):
+        """根据 digits 数组更新数字显示"""
+        for i, lbl in enumerate(self.digit_labels):
+            lbl.setText(str(self.digits[i]))
+
     def _increment_digit(self, pos):
-        """点击加号，按位增加并循环到 0"""
         if self.is_running:
-            return  # 运行时禁止通过 UI 直接修改（淡出后也会禁用）
-        # special rule: if incrementing hour tens to 2, clamp hour ones
-        maxv = self.max_digit[pos]
-        self.digits[pos] = (self.digits[pos] + 1) % (maxv + 1)
-        # If we changed the hour tens (pos==0) we must adjust hour ones max
+            return
+        self.digits[pos] += 1
+        if self.digits[pos] > self.max_digit[pos]:
+            self.digits[pos] = 0
+        # 特殊处理：小时十位变化时，需要更新小时个位的上限
         if pos == 0:
             self._enforce_hour_constraints()
-        else:
-            # if hour tens already 2, ensure ones doesn't exceed 3
-            if pos == 1:
-                # clamp to current max (which may be 3)
-                self._enforce_hour_constraints()
         self.update_digit_display()
 
     def _decrement_digit(self, pos):
-        """点击减号，按位减少并循环到最大"""
         if self.is_running:
             return
-        maxv = self.max_digit[pos]
-        self.digits[pos] = (self.digits[pos] - 1) % (maxv + 1)
+        self.digits[pos] -= 1
+        if self.digits[pos] < 0:
+            self.digits[pos] = self.max_digit[pos]
         if pos == 0:
             self._enforce_hour_constraints()
-        else:
-            if pos == 1:
-                self._enforce_hour_constraints()
         self.update_digit_display()
 
-    def update_digit_display(self):
-        """把 digits 数组更新到 UI"""
-        # Ensure hour constraints before rendering
-        self._enforce_hour_constraints()
-        for i, lbl in enumerate(self.digit_labels):
-            lbl.setText(str(self.digits[i]))
-        # 当编辑时，更新初始秒数为当前值（用于开始前的快照）
-        self._initial_seconds = self._digits_to_seconds(self.digits)
-
-    def _digits_to_seconds(self, d):
-        # Enforce hour constraints when converting
-        # d is expected length 6
-        if len(d) != 6:
-            return 0
-        h_tens = d[0]
-        h_ones = d[1]
-        # if tens == 2, ones max 3
-        if h_tens == 2 and h_ones > 3:
-            h_ones = 3
-        h = h_tens * 10 + h_ones
-        m = d[2] * 10 + d[3]
-        s = d[4] * 10 + d[5]
-        return h * 3600 + m * 60 + s
-
-    def _seconds_to_digits(self, total_seconds):
-        if total_seconds < 0:
-            total_seconds = 0
-        h = total_seconds // 3600
-        m = (total_seconds % 3600) // 60
-        s = total_seconds % 60
-        # keep within two digits per field
-        h = min(h, 99)
-        d0 = h // 10
-        d1 = h % 10
-        # enforce constraint: if d0 == 2 then d1 max 3
-        if d0 == 2 and d1 > 3:
-            d1 = 3
-        d2 = m // 10
-        d3 = m % 10
-        d4 = s // 10
-        d5 = s % 10
-        return [d0, d1, d2, d3, d4, d5]
-
     def toggle(self):
-        """开始或暂停倒计时"""
+        """切换计时器状态"""
         if self.is_running:
-            self._pause()
+            self.stop()
         else:
-            self._start()
+            self.start()
 
-    def _start(self):
-        total = self._initial_seconds if self._initial_seconds is not None else self._digits_to_seconds(self.digits)
-        if total <= 0:
+    def start(self):
+        """开始倒计时"""
+        total_seconds = self._digits_to_seconds(self.digits)
+        if total_seconds == 0:
             InfoBar.warning(
                 title="警告",
-                content="请先设置倒计时时间",
+                content="倒计时时间不能为0",
                 orient=Qt.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT,
@@ -1076,191 +1134,115 @@ class TimerInterface(QWidget):
                 parent=self
             )
             return
-        # 在开始前保存一个快照，以便点击重置时恢复到倒计时开始前的时间
-        self._pre_start_seconds = total
-        # 开始计时
-        self.current_seconds = total
+
+        # 保存当前 digits 对应的秒数（用于重置）
+        self._pre_start_seconds = total_seconds
+        self._initial_seconds = total_seconds
+
         self.is_running = True
-
-        # 开始后 3 秒触发淡出动画（允许用户在开始后短暂可见/交互）
-        QTimer.singleShot(3000, self._fade_buttons)
-
-        self.timer.start(1000)
+        self.start_button.setText("暂停计时")
         self.update_button_styles()
 
-    def _fade_buttons(self):
-        """3 秒后淡出 +、- 按钮并禁用它们（动画）"""
-        if not self.is_running:
-            return
-        # 清理之前的动画引用
-        self._animations = []
-        for btn in self.plus_buttons + self.minus_buttons:
-            effect = btn.graphicsEffect()
-            if not isinstance(effect, QGraphicsOpacityEffect):
-                effect = QGraphicsOpacityEffect(btn)
-                btn.setGraphicsEffect(effect)
-            anim = QPropertyAnimation(effect, b"opacity", self)
-            anim.setDuration(800)
-            anim.setStartValue(1.0)
-            anim.setEndValue(0.0)
-            anim.setEasingCurve(QEasingCurve.OutQuad)
-            anim.start()
-            # 保持引用以防 GC
-            self._animations.append(anim)
-            # 在动画完成后禁用并隐藏按钮（延迟设置以匹配动画）
-            def on_finished(b=btn):
-                b.setDisabled(True)
-                b.setVisible(False)
-            anim.finished.connect(on_finished)
+        # 淡出加减按钮
+        self._fade_out_controls()
 
-    def _restore_buttons(self):
-        """恢复 +、- 按钮显示、可交互和不透明（立即恢复）"""
-        # 停止并清理所有动画
-        for anim in getattr(self, "_animations", []):
-            try:
-                anim.stop()
-            except Exception:
-                pass
-        self._animations = []
-        for btn in self.plus_buttons + self.minus_buttons:
-            # 恢复可见性与可用性
-            btn.setVisible(True)
-            btn.setDisabled(False)
-            effect = btn.graphicsEffect()
-            if isinstance(effect, QGraphicsOpacityEffect):
-                effect.setOpacity(1.0)
+        self.timer.start(1000)  # 1 second interval
 
-    def _pause(self):
+    def stop(self):
+        """暂停倒计时"""
         self.is_running = False
-        self.timer.stop()
-        # 恢复编辑控制，使用户可以修改时间
-        self._restore_buttons()
+        self.start_button.setText("开始计时")
         self.update_button_styles()
+
+        # 淡入加减按钮
+        self._fade_in_controls()
+
+        self.timer.stop()
 
     def reset(self):
-        """重置到倒计时开始前的时间（如果存在），否则恢复到编辑阶段的时间"""
-        # 停止计时
-        if self.is_running:
-            self._pause()
-        # 恢复 + - 按钮
-        self._restore_buttons()
-
-        # 如果存在开始前快照，恢复到那个时间；否则使用当前初始值
+        """重置倒计时"""
+        self.stop()
+        # 如果开始前有保存的秒数，则恢复；否则恢复为初始值
         if self._pre_start_seconds is not None:
-            self.current_seconds = self._pre_start_seconds
-            self.digits = self._seconds_to_digits(self.current_seconds)
-            # 同时将 _initial_seconds 更新为快照，这样再次开始会以此为起点
-            self._initial_seconds = self._pre_start_seconds
+            self.digits = self._seconds_to_digits(self._pre_start_seconds)
+        elif self._initial_seconds is not None:
+            self.digits = self._seconds_to_digits(self._initial_seconds)
         else:
-            # 没有快照时恢复到编辑之前的 initial
-            if self._initial_seconds is None:
-                # nothing to do
-                return
-            self.current_seconds = self._initial_seconds
-            self.digits = self._seconds_to_digits(self.current_seconds)
-
-        # enforce constraints and update
+            # 默认重置为 00:05:00
+            self.digits = [0, 0, 0, 5, 0, 0]
         self._enforce_hour_constraints()
         self.update_digit_display()
+
+    def _tick(self):
+        """每秒触发一次，倒计时减一秒"""
+        total_seconds = self._digits_to_seconds(self.digits)
+        total_seconds -= 1
+        if total_seconds < 0:
+            self._timeout()
+            return
+        self.digits = self._seconds_to_digits(total_seconds)
+        self.update_digit_display()
+
+    def _timeout(self):
+        """倒计时结束"""
+        self.stop()
+        # 播放提示音
+        self._play_timeout_sound()
+        # 显示提示
         InfoBar.success(
-            title="成功",
-            content="计时已重置",
+            title="完成",
+            content="倒计时结束",
             orient=Qt.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP_RIGHT,
-            duration=1500,
+            duration=3000,
             parent=self
         )
 
-    def _play_sound(self, sound_file):
-        """播放指定声音文件"""
-        sound_path = os.path.abspath(os.path.join("assets", sound_file))
-        if not os.path.exists(sound_path):
-            return
+    def _play_timeout_sound(self):
+        """播放提示音"""
         try:
-            if QMediaPlayer is None or QMediaContent is None:
+            if QMediaPlayer is None:
                 return
-            # 创建媒体播放器并播放
-            player = QMediaPlayer(self)
-            url = QUrl.fromLocalFile(sound_path)
-            media = QMediaContent(url)
-            player.setMedia(media)
-            try:
-                player.setVolume(100)
-            except Exception:
-                pass
-            # 保持引用直到播放完成
-            self._player = player
-            player.play()
-        except Exception:
-            # 最后回退：不抛异常，仅不播放
-            pass
-
-    def _tick(self):
-        """每秒回调，倒计时递减"""
-        self.current_seconds -= 1
-        
-        # 检查是否需要播放警告音（最后三秒）
-        if self.current_seconds <= 3 and self.current_seconds > 0:
-            self._play_sound("TimerWarning.mp3")
-        
-        if self.current_seconds <= 0:
-            self.current_seconds = 0
-            self.digits = self._seconds_to_digits(0)
-            self.update_digit_display()
-            self._stop_and_notify()
-            return
-        
-        # 更新显示
-        self.digits = self._seconds_to_digits(self.current_seconds)
-        # enforce hour constraint just in case
-        self._enforce_hour_constraints()
-        self.update_digit_display()
-
-    def _stop_and_notify(self):
-        """倒计时结束处理：播放结束音，显示对话框并恢复到计时前时间"""
-        self.timer.stop()
-        self.is_running = False
-        # 恢复 + - 按钮
-        self._restore_buttons()
-        self.update_button_styles()
-
-        # 播放结束提示音（非阻塞）
-        try:
-            self._play_sound("TimerEnding.mp3")
+            if self._player is None:
+                self._player = QMediaPlayer()
+            sound_file = "assets/timeout.mp3"
+            if os.path.exists(sound_file):
+                url = QUrl.fromLocalFile(os.path.abspath(sound_file))
+                self._player.setMedia(QMediaContent(url))
+                self._player.play()
         except Exception:
             pass
 
-        # 如果有开始前快照，则恢复到该时间
-        if self._pre_start_seconds is not None:
-            self.digits = self._seconds_to_digits(self._pre_start_seconds)
-            # 更新 initial_seconds，以便下一次开始使用恢复后的时间
-            self._initial_seconds = self._pre_start_seconds
-            # enforce and update
-            self._enforce_hour_constraints()
-            self.update_digit_display()
+    def _fade_out_controls(self):
+        """淡出加减按钮"""
+        self._clear_animations()
+        for effect in self._opacity_effects:
+            anim = QPropertyAnimation(effect, b"opacity")
+            anim.setDuration(300)
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.start()
+            self._animations.append(anim)
 
-        # 使用 MessageBox 弹窗提示用户（阻塞式）
-        try:
-            w = MessageBox("计时结束", "倒计时已结束。", self.window())
-            # 仅显示"确定"按钮
-            try:
-                w.yesButton.setText('确定')
-                w.cancelButton.setVisible(False)
-            except Exception:
-                pass
-            w.exec()
-        except Exception:
-            # fallback to InfoBar if MessageBox 不可用
-            InfoBar.success(
-                title="计时结束",
-                content="倒计时已结束。",
-                orient=Qt.Horizontal,
-                isClosable=True,
-                position=InfoBarPosition.TOP_RIGHT,
-                duration=2500,
-                parent=self
-            )
+    def _fade_in_controls(self):
+        """淡入加减按钮"""
+        self._clear_animations()
+        for effect in self._opacity_effects:
+            anim = QPropertyAnimation(effect, b"opacity")
+            anim.setDuration(300)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+            anim.start()
+            self._animations.append(anim)
+
+    def _clear_animations(self):
+        """清除动画"""
+        for anim in self._animations:
+            anim.stop()
+        self._animations.clear()
 
 
 class CustomSettingCard(CardWidget):
@@ -1343,6 +1325,13 @@ class SettingsInterface(ScrollArea):
         QTimer.singleShot(0, self.load_logo)
         self.update_theme_style()
 
+        # 下载相关变量
+        self.download_signals = DownloadSignals()
+        self.download_signals.progress_updated.connect(self.on_download_progress)
+        self.download_signals.download_finished.connect(self.on_download_finished)
+        self.download_signals.error_occurred.connect(self.on_download_error)
+        self.download_info_bar = None
+
     def setup_ui(self):
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -1388,6 +1377,19 @@ class SettingsInterface(ScrollArea):
         self.avoid_repetition_card.switch.setChecked(self.settings.avoid_repetition)
         self.avoid_repetition_card.switch.checkedChanged.connect(self.on_avoid_repetition_changed)
         layout.addWidget(self.avoid_repetition_card)
+
+        # 新增：启动时检查更新 - 使用开关卡片
+        self.check_update_card = SwitchSettingCard(
+            FluentIcon.UPDATE,
+            "启动时检查更新",
+            "开启后，软件启动时自动静默检查一次更新",
+            "check_update_on_startup",
+            self,
+            self.font_family
+        )
+        self.check_update_card.switch.setChecked(self.settings.check_update_on_startup)
+        self.check_update_card.switch.checkedChanged.connect(self.on_check_update_on_startup_changed)
+        layout.addWidget(self.check_update_card)
 
         # 外观设置组
         self.appearance_label = BodyLabel("外观设置", self)
@@ -1535,11 +1537,11 @@ class SettingsInterface(ScrollArea):
         update_layout.addWidget(self.check_update_btn, 0, Qt.AlignVCenter)  # 垂直居中
         update_layout.addStretch(1)  # 底部弹性空间
 
-        # 软件版本改为 3.3.1
+        # 软件版本改为 3.3.3
         self.update_check_card = CustomSettingCard(
             FluentIcon.UPDATE,
             "版本信息",
-            "© 版权所有 2025, mc_xinyu. 当前版本 3.3.1",
+            f"© 版权所有 2025, mc_xinyu. 当前版本 {self.parent_window.settings.version}",  # 使用动态版本
             update_widget,
             self,
             self.font_family
@@ -1720,6 +1722,12 @@ class SettingsInterface(ScrollArea):
         # 避免重复设置改变时立即保存设置
         self.parent_window.save_settings()
 
+    def on_check_update_on_startup_changed(self, is_checked):
+        """启动时检查更新设置改变"""
+        self.settings.check_update_on_startup = is_checked
+        # 启动时检查更新设置改变时立即保存设置
+        self.parent_window.save_settings()
+
     def on_theme_changed(self, theme_text):
         """主题设置改变"""
         theme_map = {
@@ -1857,6 +1865,7 @@ class SettingsInterface(ScrollArea):
         """刷新设置显示"""
         self.auto_save_card.switch.setChecked(self.settings.auto_save)
         self.avoid_repetition_card.switch.setChecked(self.settings.avoid_repetition)
+        self.check_update_card.switch.setChecked(self.settings.check_update_on_startup)
 
         theme_map = {
             Theme.AUTO: "跟随系统",
@@ -1866,31 +1875,207 @@ class SettingsInterface(ScrollArea):
         self.theme_combo.setCurrentText(theme_map.get(self.settings.theme, "跟随系统"))
 
     def on_check_updates_clicked(self):
-        """检查更新按钮逻辑 - 打开GitHub发布页面"""
-        # 打开GitHub发布页面
+        """检查更新按钮逻辑 - 从GitHub获取最新版本信息"""
+        self._check_updates(silent=False)
+
+    def silent_check_updates_on_startup(self):
+        """启动时静默检查更新"""
+        self._check_updates(silent=True)
+
+    def _check_updates(self, silent=False):
+        """检查更新核心逻辑"""
         try:
-            webbrowser.open("https://github.com/mc-xinyu/QuantumRollCall/releases")
+            # 从指定URL获取最新版本信息
+            url = "https://ghproxy.net/https://raw.githubusercontent.com/mc-xinyu/QuantumRollCallUpdate/main/version.txt"
+            with urllib.request.urlopen(url, timeout=10) as response:
+                content = response.read().decode('utf-8').strip()
+                lines = content.split('\n')
+                
+                if len(lines) >= 2:
+                    latest_version = lines[0].strip()
+                    download_url = lines[1].strip()
+                    
+                    current_version = self.parent_window.settings.version
+                    
+                    if latest_version != current_version:
+                        if not silent:
+                            # 显示更新对话框
+                            title = "检查更新"
+                            content = f"发现新版本 {latest_version}，是否立即更新？"
+                            
+                            w = MessageBox(title, content, self.window())
+                            w.yesButton.setText('确定')
+                            w.cancelButton.setText('取消')
+                            
+                            if w.exec():
+                                # 用户点击确定，下载更新包
+                                self.start_download_update(latest_version, download_url)
+                        else:
+                            # 启动静默检查时，发现新版本则弹出对话框（和手动一样）
+                            title = "检查更新"
+                            content = f"发现新版本 {latest_version}，是否立即更新？"
+                            
+                            w = MessageBox(title, content, self.window())
+                            w.yesButton.setText('确定')
+                            w.cancelButton.setText('取消')
+                            
+                            if w.exec():
+                                # 用户点击确定，下载更新包
+                                self.start_download_update(latest_version, download_url)
+                    else:
+                        if not silent:
+                            InfoBar.success(
+                                title="检查更新",
+                                content="当前已是最新版本",
+                                orient=Qt.Horizontal,
+                                isClosable=True,
+                                position=InfoBarPosition.TOP_RIGHT,
+                                duration=2000,
+                                parent=self
+                            )
+                        # silent: do nothing
+                else:
+                    raise ValueError("无法检查更新")
+                    
         except Exception as e:
-            # 如果打开浏览器失败，显示错误信息（这个仍然可以自动关闭）
+            if not silent:
+                print(f"检查更新失败: {e}")
+                InfoBar.error(
+                    title="检查更新",
+                    content="无法连接至更新服务器，请检查网络连接",
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=3000,
+                    parent=self
+                )
+            # silent: do nothing
+
+    def start_download_update(self, version, url):
+        """开始下载更新（使用线程避免界面卡死）"""
+        # 创建下载进度消息条
+        self.download_info_bar = InfoBar(
+            icon=InfoBarIcon.INFORMATION,
+            title="更新",
+            content="正在下载更新",
+            orient=Qt.Horizontal,
+            isClosable=False,
+            position=InfoBarPosition.TOP,
+            duration=-1,  # 永久显示
+            parent=self
+        )
+        self.download_info_bar.show()
+        
+        # 在线程中执行下载
+        download_thread = threading.Thread(
+            target=self.download_update_thread,
+            args=(version, url)
+        )
+        download_thread.daemon = True
+        download_thread.start()
+
+    def download_update_thread(self, version, url):
+        """下载更新的线程函数"""
+        try:
+            # 创建downloads目录
+            downloads_dir = "downloads"
+            os.makedirs(downloads_dir, exist_ok=True)
+            
+            # 下载文件
+            filename = os.path.join(downloads_dir, f"{version}.zip")
+            
+            def update_progress(block_num, block_size, total_size):
+                """更新下载进度"""
+                if total_size > 0:
+                    downloaded = block_num * block_size
+                    self.download_signals.progress_updated.emit(downloaded, total_size)
+            
+            # 下载文件
+            urllib.request.urlretrieve(url, filename, update_progress)
+            
+            # 解压文件到 downloads/update 目录
+            extract_path = os.path.join(downloads_dir, "update")
+            os.makedirs(extract_path, exist_ok=True)
+            
+            with zipfile.ZipFile(filename, 'r') as zip_ref:
+                # 获取压缩包中根目录的所有文件和文件夹
+                for file_info in zip_ref.infolist():
+                    # 提取根目录下的文件和文件夹（不包含子目录中的内容）
+                    if '/' not in file_info.filename or file_info.filename.count('/') == 1:
+                        # 如果是根目录的文件或一级子目录
+                        zip_ref.extract(file_info, extract_path)
+            
+            # 下载完成
+            self.download_signals.download_finished.emit()
+            
+        except Exception as e:
+            error_msg = f"下载更新失败: {str(e)}"
+            self.download_signals.error_occurred.emit(error_msg)
+
+    def on_download_progress(self, downloaded, total_size):
+        """更新下载进度"""
+        if total_size > 0:
+            progress = int(downloaded * 100 / total_size)
+            if self.download_info_bar:
+                self.download_info_bar.setContent(f"下载进度: {progress}%")
+                
+            # 如果下载完成
+            if downloaded >= total_size:
+                if self.download_info_bar:
+                    self.download_info_bar.setContent("下载完成，正在解压...")
+
+    def on_download_finished(self):
+        """下载完成处理"""
+        if self.download_info_bar:
+            self.download_info_bar.close()
+            self.download_info_bar = None
+        
+        # 查找并运行程序根目录的 Update.exe
+        current_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        update_exe_path = os.path.join(current_dir, "Update.exe")
+        
+        if os.path.exists(update_exe_path):
+            try:
+                import subprocess
+                subprocess.Popen([update_exe_path])
+                
+                # 静默关闭程序，不显示任何消息条
+                QTimer.singleShot(500, QApplication.quit)
+            except Exception as e:
+                InfoBar.error(
+                    title="错误",
+                    content=f"无法启动更新程序: {str(e)}",
+                    orient=Qt.Horizontal,
+                    isClosable=True,
+                    position=InfoBarPosition.TOP_RIGHT,
+                    duration=3000,
+                    parent=self
+                )
+        else:
             InfoBar.error(
-                title="错误",
-                content=f"无法打开浏览器: {str(e)}",
+                title="警告",
+                content="更新下载完成，未找到更新程序",
                 orient=Qt.Horizontal,
                 isClosable=True,
                 position=InfoBarPosition.TOP_RIGHT,
                 duration=3000,
                 parent=self
             )
-            return
-        
-        # 显示不会自动关闭的警告消息条
-        InfoBar.warning(
-            title="检查更新",
-            content="若无法访问请使用Watt Toolkit加速器",
+
+    def on_download_error(self, error_msg):
+        """错误处理"""
+        print(error_msg)
+        if self.download_info_bar:
+            self.download_info_bar.close()
+            self.download_info_bar = None
+            
+        InfoBar.error(
+            title="更新",
+            content="无法下载更新文件，请检查网络连接",
             orient=Qt.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP_RIGHT,
-            duration=-1,  # 设置为-1表示不会自动关闭
+            duration=3000,
             parent=self
         )
 
