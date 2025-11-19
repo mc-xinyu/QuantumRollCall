@@ -7,14 +7,16 @@ import urllib.request
 import urllib.error
 import zipfile
 import threading
-from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QEasingCurve, QUrl, pyqtSignal, QObject
+from plyer import notification
+from PyQt5.QtCore import Qt, QTimer, QSize, QPropertyAnimation, QParallelAnimationGroup, QSequentialAnimationGroup, QEasingCurve, QUrl, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QPalette, QColor, QFont, QFontDatabase, QPixmap
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QStackedWidget, QFrame, QLabel, QFileDialog, QListWidgetItem,
                              QSpacerItem, QSizePolicy, QGraphicsDropShadowEffect,
                              QGraphicsOpacityEffect, QProgressDialog)
 
-# Multimedia imports for sound playback (mp3)
+
+# 多媒体导入（用于MP3音频播放）
 try:
     from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 except Exception:
@@ -31,7 +33,11 @@ from qfluentwidgets import (NavigationInterface, NavigationItemPosition, Navigat
                             ExpandSettingCard, SettingCardGroup, HyperlinkCard,
                             ColorDialog, setCustomStyleSheet,
                             SwitchButton, SettingCard, Dialog, MessageBoxBase, IconWidget)
-
+try:
+    from PyQt5.QtWinExtras import QtWin
+    HAS_WINEXTRAS = True
+except ImportError:
+    HAS_WINEXTRAS = False
 
 class DownloadSignals(QObject):
     """下载信号类，用于线程间通信"""
@@ -43,7 +49,7 @@ class DownloadSignals(QObject):
 class NameListManager:
     """名单管理器"""
     def __init__(self):
-        # 默认名单改为空
+        # 默认名单为空
         self.names = []
         self.used_names = set()
 
@@ -137,9 +143,11 @@ class Settings:
     def __init__(self):
         self.auto_save = True
         self.avoid_repetition = True
-        self.check_update_on_startup = False  # 新增：启动时检查更新
+        self.check_update_on_startup = True  # 新增：启动时检查更新
         self.theme = Theme.AUTO
-        self.version = "3.3.3"  # 当前版本
+        self.version = "3.3.5"  # 当前版本
+        # 新增：倒计时结束后显示系统通知
+        self.show_timer_notification = True
 
     def load_from_file(self, filename):
         """从文件加载设置"""
@@ -152,7 +160,9 @@ class Settings:
                     self.check_update_on_startup = data.get('check_update_on_startup', False)
                     theme_str = data.get('theme', 'AUTO')
                     self.theme = getattr(Theme, theme_str, Theme.AUTO)
-                    self.version = data.get('version', "3.3.3")  # 加载版本
+                    self.version = data.get('version', "3.3.5")  # 加载版本
+                    # 新增：加载倒计时通知设置
+                    self.show_timer_notification = data.get('show_timer_notification', True)
                 return True
             return False
         except Exception:
@@ -167,7 +177,9 @@ class Settings:
                 'avoid_repetition': self.avoid_repetition,
                 'check_update_on_startup': self.check_update_on_startup,
                 'theme': self.theme.name,
-                'version': self.version  # 保存版本
+                'version': self.version,  # 保存版本
+                # 新增：保存倒计时通知设置
+                'show_timer_notification': self.show_timer_notification
             }
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -181,7 +193,9 @@ class Settings:
         self.avoid_repetition = True
         self.check_update_on_startup = False
         self.theme = Theme.AUTO
-        self.version = "3.3.3"  # 重置版本
+        self.version = "3.3.5"  # 重置版本
+        # 新增：重置倒计时通知设置
+        self.show_timer_notification = True
 
 
 class MainWindow(FluentWindow):
@@ -196,12 +210,12 @@ class MainWindow(FluentWindow):
         self.name_list_path = os.path.join(self.config_dir, "name_list.json")
         self.settings_path = os.path.join(self.config_dir, "settings.json")
 
-        # -------- Apply saved theme early to avoid startup flicker ----------
-        # Load settings synchronously (very small I/O) and set theme before building UI.
-        # This prevents the window briefly showing in the wrong (light) theme when the user configured dark.
+        # -------- 提前应用保存的主题以避免启动闪烁 ----------
+        # 同步加载设置（非常小的I/O操作）并在构建UI前设置主题
+        # 这可以防止当用户配置了深色主题时窗口短暂显示错误的（浅色）主题
         self.settings.load_from_file(self.settings_path)
         setTheme(self.settings.theme)
-        # choose theme color consistent with apply_settings()
+        # 选择与apply_settings()一致的主题颜色
         if self.settings.theme == Theme.DARK:
             initial_theme_color = QColor("#6c8fff")
         elif self.settings.theme == Theme.LIGHT:
@@ -214,7 +228,7 @@ class MainWindow(FluentWindow):
         # 启动时尽量不阻塞：先用一个安全的默认字体名，实际字体在延迟初始化中载入并应用
         self.custom_font_family = "Microsoft YaHei"
 
-        # UI 先构建（主题已提前应用，避免闪烁）
+        # UI先构建（主题已提前应用，避免闪烁）
         self.setup_ui()
 
         # 延迟完成启动工作（加载字体、图标、配置和名册，并应用设置）
@@ -222,6 +236,7 @@ class MainWindow(FluentWindow):
 
     def finish_startup(self):
         """延后初始化：加载字体、图标、配置和名册，并应用设置"""
+        # 加载字体
         loaded_font = self.load_custom_font()
         if loaded_font:
             self.custom_font_family = loaded_font
@@ -237,15 +252,15 @@ class MainWindow(FluentWindow):
                 self.timer_interface.update_button_styles()
                 self.timer_interface.update_digit_styles()
 
-        # 仅使用 ico 作为图标（不再尝试 png）
+        # 仅使用ico作为图标（不再尝试png）
         self.set_window_icon()
 
         # 加载数据（名单等）
         self.load_data()
-        # Re-apply settings to ensure all UI reflects current settings values
+        # 重新应用设置以确保所有UI反映当前设置值
         self.apply_settings()
         
-        # 检查版本更新
+        # 检查版本更新（在所有资源加载完成后）
         self.check_version_update()
 
         # 新增：启动时自动检查更新（静默，只在不是最新且联网正常时弹出对话框）
@@ -255,29 +270,71 @@ class MainWindow(FluentWindow):
 
     def check_version_update(self):
         """检查版本更新并显示更新对话框"""
-        current_version = "3.3.3"  # 当前程序版本
+        current_version = "3.3.5"  # 当前程序版本
         saved_version = self.settings.version  # 配置文件中保存的版本
         
         if saved_version != current_version:
-            # 显示更新对话框
-            self.show_update_dialog(saved_version, current_version)
+            # 确保窗口已经完全显示并且居中
+            # 先恢复最大化显示，然后居中对话框
+            self.showMaximized()  # 恢复最大化显示
+            
+            # 使用QTimer.singleShot确保在下一个事件循环中显示对话框
+            # 这样能保证所有UI组件都已经完全加载和渲染
+            QTimer.singleShot(100, lambda: self.show_update_dialog(saved_version, current_version))
             
             # 更新配置文件中的版本
             self.settings.version = current_version
             self.save_settings()
 
-    def show_update_dialog(self, old_version, new_version):
-        """显示更新对话框 - 使用带遮罩的对话框样式"""
-        title = f"已更新到 {new_version}"
-        content = "新版本内容：\n · 更新后展示更新内容对话框\n · 添加自动更新功能\n · 支持启动时自动检查更新"
+    def center_dialog(self, dialog):
+        """居中显示对话框（在最大化窗口的中心）"""
+        # 获取屏幕的几何信息
+        screen_geometry = QApplication.primaryScreen().availableGeometry()
         
-        # 使用 MessageBox 创建带遮罩的对话框
-        w = MessageBox(title, content, self)
-        # 修改按钮文字为中文
-        w.yesButton.setText('确定')
-        w.cancelButton.setVisible(False)  # 隐藏取消按钮，只显示确定按钮
-        w.exec()
+        # 获取对话框的大小
+        dialog_size = dialog.size()
+        
+        # 计算对话框在屏幕中心的位置
+        x = (screen_geometry.width() - dialog_size.width()) // 2
+        y = (screen_geometry.height() - dialog_size.height()) // 2
+        
+        # 移动对话框到屏幕中心位置
+        dialog.move(x, y)
 
+    def show_update_dialog(self, old_version, new_version):
+        """显示更新对话框"""
+        title = f"已更新到 {new_version}"
+
+        content = """
+    主要更新内容：
+
+    新增功能
+    • 添加计时结束时用系统消息提醒
+    • 在通用设置中添加"倒计时结束显示系统通知"的设置选项
+    """
+        
+        # 使用MessageBox创建带遮罩的对话框
+        w = MessageBox(title, content, self)
+        
+        # 确保对话框居中
+        w.setWindowModality(Qt.ApplicationModal)
+        
+        # 修改按钮文字
+        w.yesButton.setText('确定')
+        w.cancelButton.setVisible(False)  # 隐藏取消按钮
+        
+        # 在确定按钮右侧添加超链接按钮
+        link_button = PushButton('        查看详情        ', w.buttonLayout.widget())
+        link_button.clicked.connect(lambda: webbrowser.open('https://github.com/mc-xinyu/QuantumRollCall/releases'))
+        
+        # 将链接按钮添加到确定按钮之后
+        w.buttonLayout.addWidget(link_button)
+        w.buttonLayout.insertSpacing(2, 10)  # 添加一些间距
+        
+        # 确保对话框居中显示
+        self.center_dialog(w)
+        w.exec()
+    
     def load_custom_font(self):
         """加载自定义字体（延迟执行以减少启动阻塞）"""
         try:
@@ -293,7 +350,7 @@ class MainWindow(FluentWindow):
             return None
 
     def set_window_icon(self):
-        """设置窗口图标，只使用 assets/icon.ico"""
+        """设置窗口图标，只使用assets/icon.ico"""
         try:
             ico_path = "assets/icon.ico"
             if os.path.exists(ico_path):
@@ -330,7 +387,7 @@ class MainWindow(FluentWindow):
             if hasattr(self.settings_interface, 'refresh_name_list'):
                 self.settings_interface.refresh_name_list()
 
-            # 立即保存名单到文件（稍后调度以减少 UI 阻塞）
+            # 立即保存名单到文件（稍后调度以减少UI阻塞）
             QTimer.singleShot(0, self.save_name_list)
 
             InfoBar.success(
@@ -362,7 +419,7 @@ class MainWindow(FluentWindow):
             if hasattr(self.settings_interface, 'refresh_name_list'):
                 self.settings_interface.refresh_name_list()
 
-            # 将保存延后（异步调度到事件循环），避免在删除时阻塞 UI 导致卡顿
+            # 将保存延后（异步调度到事件循环），避免在删除时阻塞UI导致卡顿
             QTimer.singleShot(0, self.save_name_list)
 
             InfoBar.success(
@@ -527,7 +584,7 @@ class MainWindow(FluentWindow):
 
     def apply_settings(self):
         """应用设置"""
-        # Apply theme and theme color (this is safe to call multiple times)
+        # 应用主题和主题颜色（多次调用是安全的）
         setTheme(self.settings.theme)
         if self.settings.theme == Theme.DARK:
             theme_color = QColor("#6c8fff")
@@ -564,7 +621,7 @@ class MainWindow(FluentWindow):
 
     def load_data(self):
         """加载数据"""
-        # 只加载名册文件 here; settings 已在构造早期加载以避免闪烁
+        # 只加载名册文件；设置已在构造早期加载以避免闪烁
         self.name_manager.load_from_file(self.name_list_path)
         if hasattr(self, 'settings_interface'):
             self.settings_interface.refresh_name_list()
@@ -820,10 +877,10 @@ class TimerInterface(QWidget):
         self.font_family = font_family
         self.setObjectName("TimerInterface")
 
-        # digits: [H_tens, H_ones, M_tens, M_ones, S_tens, S_ones]
-        # 初始时间设为 5 分钟 => 00:05:00
+        # 数字数组：[小时十位, 小时个位, 分钟十位, 分钟个位, 秒十位, 秒个位]
+        # 初始时间设为5分钟 => 00:05:00
         self.digits = [0, 0, 0, 5, 0, 0]
-        # max per position: default; hour ones will be adjusted dynamically
+        # 每个位置的最大值：默认值；小时个位将动态调整
         self.max_digit = [2, 9, 5, 9, 5, 9]
 
         self.is_running = False
@@ -842,10 +899,10 @@ class TimerInterface(QWidget):
         self._player = None
 
         self._build_ui()
-        # 确保 initial_seconds 与 digits 同步
+        # 确保initial_seconds与digits同步
         if self._initial_seconds is None:
             self._initial_seconds = self._digits_to_seconds(self.digits)
-        # enforce hour constraints on startup
+        # 启动时强制执行小时约束
         self._enforce_hour_constraints()
         self.update_button_styles()
         self.update_digit_styles()
@@ -855,7 +912,7 @@ class TimerInterface(QWidget):
         layout.setContentsMargins(40, 20, 40, 40)
         layout.setSpacing(20)
 
-        # segmented header similar to image (倒计时 / 计时器)
+        # 分段标题（倒计时 / 计时器）
         try:
             sv = SegmentedWidget()
             sv.addSegment("倒计时")
@@ -866,13 +923,13 @@ class TimerInterface(QWidget):
             title = TitleLabel("倒计时", self)
             layout.addWidget(title)
 
-        # digits area
+        # 数字区域
         digits_container = QWidget()
         digits_layout = QHBoxLayout(digits_container)
         digits_layout.setAlignment(Qt.AlignCenter)
         digits_layout.setSpacing(24)
 
-        # create six digit columns grouped as HH : MM : SS
+        # 创建六个数字列，分组为HH : MM : SS
         self.digit_labels = []
         self.plus_buttons = []
         self.minus_buttons = []
@@ -899,7 +956,7 @@ class TimerInterface(QWidget):
             minus.clicked.connect(lambda _, p=pos: self._decrement_digit(p))
             l.addWidget(minus, 0, Qt.AlignHCenter)
 
-            # 为 plus/minus 添加透明度效果，便于淡出动画
+            # 为plus/minus添加透明度效果，便于淡出动画
             for btn in (plus, minus):
                 effect = QGraphicsOpacityEffect(btn)
                 btn.setGraphicsEffect(effect)
@@ -912,21 +969,21 @@ class TimerInterface(QWidget):
 
             return w
 
-        # HH
+        # 小时部分
         digits_layout.addWidget(make_digit_widget(0))
         digits_layout.addWidget(make_digit_widget(1))
 
-        # colon
+        # 冒号
         colon1 = QLabel(":", self)
         colon1.setStyleSheet(f"QLabel {{ font-family: '{self.font_family}'; font-size: 40px; font-weight: bold; }}")
-        # 添加透明度效果以便在主题切换时仍可控制样式（但不动画 colon）
+        # 添加透明度效果以便在主题切换时仍可控制样式（但不动画冒号）
         effect_col1 = QGraphicsOpacityEffect(colon1)
         colon1.setGraphicsEffect(effect_col1)
         effect_col1.setOpacity(1.0)
         self.colon_labels.append(colon1)
         digits_layout.addWidget(colon1)
 
-        # MM
+        # 分钟部分
         digits_layout.addWidget(make_digit_widget(2))
         digits_layout.addWidget(make_digit_widget(3))
 
@@ -938,17 +995,17 @@ class TimerInterface(QWidget):
         self.colon_labels.append(colon2)
         digits_layout.addWidget(colon2)
 
-        # SS
+        # 秒部分
         digits_layout.addWidget(make_digit_widget(4))
         digits_layout.addWidget(make_digit_widget(5))
 
         layout.addWidget(digits_container, 1)
 
-        # start / reset buttons area
+        # 开始/重置按钮区域
         btn_layout = QHBoxLayout()
         btn_layout.addStretch(1)
 
-        # 按钮顺序调整：开始计时放在左边，重置放在右边（满足你的要求）
+        # 按钮顺序调整：开始计时放在左边，重置放在右边
         self.start_button = PrimaryPushButton("开始计时", self)
         self.start_button.setFixedSize(150, 50)
         self.start_button.clicked.connect(self.toggle)
@@ -957,7 +1014,7 @@ class TimerInterface(QWidget):
         self.reset_button.setFixedSize(150, 50)
         self.reset_button.clicked.connect(self.reset)
 
-        # Start on the left, Reset on the right
+        # 开始按钮在左，重置按钮在右
         btn_layout.addWidget(self.start_button)
         btn_layout.addSpacing(30)
         btn_layout.addWidget(self.reset_button)
@@ -973,19 +1030,19 @@ class TimerInterface(QWidget):
             self.max_digit[1] = 3
         else:
             self.max_digit[1] = 9
-        # clamp the hour ones digit if necessary
+        # 必要时限制小时个位数字
         if self.digits[1] > self.max_digit[1]:
             self.digits[1] = self.max_digit[1]
 
-    def update_digit_styles(self):
+    def update_digit_styles(self, warning_color=False):
         """根据主题更新数字、按钮、冒号样式"""
         is_dark = isDarkTheme()
 
         title_color = "#6c8fff" if is_dark else "#4a6bff"
-        digit_color = "white" if is_dark else "black"
-        # plus/minus color - 使用与点名按钮边框一致的颜色，让它们在深浅色下都可见
+        digit_color = "#f55066" if warning_color else ("white" if is_dark else "black")  # 根据警告状态选择颜色
+        # 加减按钮颜色 - 使用与点名按钮边框一致的颜色，让它们在深浅色下都可见
         control_color = "white" if is_dark else "#666666"
-        colon_color = digit_color
+        colon_color = "#f55066" if warning_color else digit_color  # 冒号颜色也跟随警告状态
 
         for lbl in self.digit_labels:
             lbl.setStyleSheet(f"""
@@ -1001,7 +1058,7 @@ class TimerInterface(QWidget):
                 }}
             """)
 
-        # plus/minus button style (small circular)
+        # 加减按钮样式（小圆形）
         for btn in self.plus_buttons + self.minus_buttons:
             btn.setStyleSheet(f"""
                 PushButton {{
@@ -1068,18 +1125,18 @@ class TimerInterface(QWidget):
         self.reset_button.setStyleSheet(reset_style)
 
     def update_button_styles(self):
-        """更新按钮样式（与 update_digit_styles 合并）"""
+        """更新按钮样式（与update_digit_styles合并）"""
         self.update_digit_styles()
 
     def _digits_to_seconds(self, digits):
-        """将 digits 数组转换为总秒数"""
+        """将digits数组转换为总秒数"""
         h = digits[0] * 10 + digits[1]
         m = digits[2] * 10 + digits[3]
         s = digits[4] * 10 + digits[5]
         return h * 3600 + m * 60 + s
 
     def _seconds_to_digits(self, seconds):
-        """将总秒数转换为 digits 数组"""
+        """将总秒数转换为digits数组"""
         seconds = max(0, seconds)
         h = seconds // 3600
         seconds %= 3600
@@ -1088,7 +1145,7 @@ class TimerInterface(QWidget):
         return [h // 10, h % 10, m // 10, m % 10, s // 10, s % 10]
 
     def update_digit_display(self):
-        """根据 digits 数组更新数字显示"""
+        """根据digits数组更新数字显示"""
         for i, lbl in enumerate(self.digit_labels):
             lbl.setText(str(self.digits[i]))
 
@@ -1135,7 +1192,7 @@ class TimerInterface(QWidget):
             )
             return
 
-        # 保存当前 digits 对应的秒数（用于重置）
+        # 保存当前digits对应的秒数（用于重置）
         self._pre_start_seconds = total_seconds
         self._initial_seconds = total_seconds
 
@@ -1146,7 +1203,7 @@ class TimerInterface(QWidget):
         # 淡出加减按钮
         self._fade_out_controls()
 
-        self.timer.start(1000)  # 1 second interval
+        self.timer.start(1000)  # 1秒间隔
 
     def stop(self):
         """暂停倒计时"""
@@ -1168,50 +1225,115 @@ class TimerInterface(QWidget):
         elif self._initial_seconds is not None:
             self.digits = self._seconds_to_digits(self._initial_seconds)
         else:
-            # 默认重置为 00:05:00
+            # 默认重置为00:05:00
             self.digits = [0, 0, 0, 5, 0, 0]
         self._enforce_hour_constraints()
         self.update_digit_display()
+        # 重置时恢复正常颜色
+        self.update_digit_styles(warning_color=False)
 
     def _tick(self):
         """每秒触发一次，倒计时减一秒"""
         total_seconds = self._digits_to_seconds(self.digits)
         total_seconds -= 1
+        
+        # 检查是否需要播放3秒警告音
+        if total_seconds <= 3 and total_seconds >= 1:
+            self._play_warning_sound()
+        
+        # 检查是否剩余最后1分钟（60秒），改变字体颜色
+        if total_seconds <= 60 and total_seconds >= 0:
+            self.update_digit_styles(warning_color=True)
+        else:
+            self.update_digit_styles(warning_color=False)
+        
         if total_seconds < 0:
             self._timeout()
             return
+        
         self.digits = self._seconds_to_digits(total_seconds)
         self.update_digit_display()
 
     def _timeout(self):
         """倒计时结束"""
         self.stop()
-        # 播放提示音
-        self._play_timeout_sound()
-        # 显示提示
-        InfoBar.success(
-            title="完成",
-            content="倒计时结束",
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP_RIGHT,
-            duration=3000,
-            parent=self
-        )
+        # 播放结束提示音
+        self._play_ending_sound()
+        # 恢复时间到计时前的时间
+        self._restore_time()
+        # 恢复正常颜色
+        self.update_digit_styles(warning_color=False)
+        # 显示消息
+        self._show_notification()
+        # 显示完成对话框
+        self._show_timeout_dialog()
 
-    def _play_timeout_sound(self):
-        """播放提示音"""
+    def _restore_time(self):
+        """恢复时间到计时前的时间"""
+        if self._pre_start_seconds is not None:
+            self.digits = self._seconds_to_digits(self._pre_start_seconds)
+            self.update_digit_display()
+
+    def _play_warning_sound(self):
+        """播放3秒警告音"""
         try:
             if QMediaPlayer is None:
                 return
             if self._player is None:
                 self._player = QMediaPlayer()
-            sound_file = "assets/timeout.mp3"
+            sound_file = "assets/TimerWarning.mp3"
             if os.path.exists(sound_file):
                 url = QUrl.fromLocalFile(os.path.abspath(sound_file))
                 self._player.setMedia(QMediaContent(url))
                 self._player.play()
         except Exception:
+            pass
+
+    def _play_ending_sound(self):
+        """播放结束提示音"""
+        try:
+            if QMediaPlayer is None:
+                return
+            if self._player is None:
+                self._player = QMediaPlayer()
+            sound_file = "assets/TimerEnding.mp3"
+            if os.path.exists(sound_file):
+                url = QUrl.fromLocalFile(os.path.abspath(sound_file))
+                self._player.setMedia(QMediaContent(url))
+                self._player.play()
+        except Exception:
+            pass
+
+    def _show_timeout_dialog(self):
+        """显示倒计时结束对话框"""
+        title = "倒计时结束"
+        content = "设定的倒计时时间已到！"
+        
+        w = MessageBox(title, content, self.window())
+        w.yesButton.setText('确定')
+        w.cancelButton.setVisible(False)  # 隐藏取消按钮
+        
+        w.exec()
+
+    def _show_notification(self):
+        """显示系统通知（根据设置决定是否显示）"""
+        # 检查设置是否开启
+        if hasattr(self, 'parent_window') and self.parent_window and \
+           hasattr(self.parent_window.settings, 'show_timer_notification') and \
+           not self.parent_window.settings.show_timer_notification:
+            return  # 设置关闭，不显示通知
+        
+        try:
+            notification.notify(
+                title='计时时间到',
+                message='设置的倒计时时间已到！',
+                app_name='量子点名系统',
+                timeout=10,
+                app_icon='assets\\icon.ico',
+                toast=True
+            )
+        except Exception:
+            # 如果通知失败，静默处理
             pass
 
     def _fade_out_controls(self):
@@ -1321,7 +1443,6 @@ class SettingsInterface(ScrollArea):
         self.font_family = font_family
         self.setObjectName("SettingsInterface")
         self.setup_ui()
-        # 延迟加载 logo 等资源，减少阻塞
         QTimer.singleShot(0, self.load_logo)
         self.update_theme_style()
 
@@ -1335,24 +1456,20 @@ class SettingsInterface(ScrollArea):
     def setup_ui(self):
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
+        
         container = QWidget()
-        # 给容器设置对象名，避免对所有 QWidget 使用通配样式
         container.setObjectName("settings_container")
         layout = QVBoxLayout(container)
         layout.setContentsMargins(40, 20, 40, 40)
         layout.setSpacing(20)
 
-        # 标题
         self.title_label = TitleLabel("系统设置", self)
         self.title_label.setAlignment(Qt.AlignLeft)
         layout.addWidget(self.title_label)
-
-        # 常规设置组
+        
         self.general_label = BodyLabel("常规设置", self)
         layout.addWidget(self.general_label)
 
-        # 自动保存设置 - 使用开关卡片
         self.auto_save_card = SwitchSettingCard(
             FluentIcon.SAVE,
             "自动保存设置",
@@ -1365,7 +1482,6 @@ class SettingsInterface(ScrollArea):
         self.auto_save_card.switch.checkedChanged.connect(self.on_auto_save_changed)
         layout.addWidget(self.auto_save_card)
 
-        # 避免重复点名 - 使用开关卡片
         self.avoid_repetition_card = SwitchSettingCard(
             FluentIcon.SYNC,
             "避免重复点名",
@@ -1378,7 +1494,19 @@ class SettingsInterface(ScrollArea):
         self.avoid_repetition_card.switch.checkedChanged.connect(self.on_avoid_repetition_changed)
         layout.addWidget(self.avoid_repetition_card)
 
-        # 新增：启动时检查更新 - 使用开关卡片
+        # 新增：倒计时通知设置卡片
+        self.timer_notification_card = SwitchSettingCard(
+            FluentIcon.MESSAGE,
+            "倒计时结束后显示系统通知",
+            "开启后，倒计时结束时会在系统通知中心显示提示",
+            "show_timer_notification",
+            self,
+            self.font_family
+        )
+        self.timer_notification_card.switch.setChecked(self.settings.show_timer_notification)
+        self.timer_notification_card.switch.checkedChanged.connect(self.on_timer_notification_changed)
+        layout.addWidget(self.timer_notification_card)
+
         self.check_update_card = SwitchSettingCard(
             FluentIcon.UPDATE,
             "启动时检查更新",
@@ -1391,11 +1519,9 @@ class SettingsInterface(ScrollArea):
         self.check_update_card.switch.checkedChanged.connect(self.on_check_update_on_startup_changed)
         layout.addWidget(self.check_update_card)
 
-        # 外观设置组
         self.appearance_label = BodyLabel("外观设置", self)
         layout.addWidget(self.appearance_label)
 
-        # 主题设置 - 保持原有布局
         theme_widget = QWidget()
         theme_layout = QHBoxLayout(theme_widget)
         theme_layout.setContentsMargins(0, 0, 0, 0)
@@ -1426,11 +1552,9 @@ class SettingsInterface(ScrollArea):
         )
         layout.addWidget(self.theme_card)
 
-        # 名单管理组
         self.name_label = BodyLabel("名单管理", self)
         layout.addWidget(self.name_label)
 
-        # 添加名字卡片 - 保持原有布局
         add_name_widget = QWidget()
         add_name_layout = QHBoxLayout(add_name_widget)
         add_name_layout.setContentsMargins(0, 0, 0, 0)
@@ -1458,7 +1582,6 @@ class SettingsInterface(ScrollArea):
         )
         layout.addWidget(self.add_name_card)
 
-        # 名单列表卡片 - 保持原有布局
         list_widget = QWidget()
         list_layout = QVBoxLayout(list_widget)
         list_layout.setContentsMargins(0, 0, 0, 0)
@@ -1467,7 +1590,6 @@ class SettingsInterface(ScrollArea):
         self.name_list.setMinimumHeight(200)
         list_layout.addWidget(self.name_list)
 
-        # 操作按钮 - 将"删除选中"改为"清空名单"
         operation_layout = QHBoxLayout()
         self.export_names_btn = PushButton(FluentIcon.SHARE, "导出名单", self)
         self.import_names_btn = PushButton(FluentIcon.DOWNLOAD, "导入名单", self)
@@ -1475,7 +1597,6 @@ class SettingsInterface(ScrollArea):
 
         self.export_names_btn.clicked.connect(self.parent_window.export_name_list)
         self.import_names_btn.clicked.connect(self.parent_window.import_name_list)
-        # connect to local handler which will show confirmation overlay
         self.clear_names_btn.clicked.connect(self.on_clear_names_clicked)
 
         operation_layout.addWidget(self.export_names_btn)
@@ -1494,21 +1615,16 @@ class SettingsInterface(ScrollArea):
         )
         layout.addWidget(self.list_card)
 
-        # 关于信息组
         self.about_label = BodyLabel("关于", self)
         layout.addWidget(self.about_label)
 
         about_widget = QWidget()
         about_layout = QVBoxLayout(about_widget)
         about_layout.setSpacing(15)
-
-        # 占位 logo_label，实际 pixmap 延后加载以加快启动
         self.logo_label = QLabel()
         self.logo_label.setAlignment(Qt.AlignCenter)
         self.logo_label.setStyleSheet("background: transparent; border: none;")
         about_layout.addWidget(self.logo_label)
-
-        # 简化关于信息，只保留必要的描述
         about_title = BodyLabel("基于 PyQt-Fluent-Widgets 制作", self)
         about_layout.addWidget(about_title)
 
@@ -1522,33 +1638,137 @@ class SettingsInterface(ScrollArea):
         )
         layout.addWidget(self.about_card)
 
-        # 新增：检查更新卡片（位于软件信息卡片下），展示版本并提供"检查更新"按钮
         update_widget = QWidget()
         update_layout = QHBoxLayout(update_widget)
         update_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 右侧检查更新按钮（颜色会在 update_theme_style 中根据主题切换）
-        self.check_update_btn = PushButton("检查更新", self)
-        self.check_update_btn.setFixedSize(120, 40)
+        # ====== 创建"检查更新"按钮，内部布局：居中文本（移除图标）======
+        is_dark_initial = isDarkTheme()
+        text_color_initial = "white" if is_dark_initial else "black"
+
+        self.check_update_btn = PushButton(self)
+        self.check_update_btn.setFixedSize(160, 40)
         self.check_update_btn.clicked.connect(self.on_check_updates_clicked)
+        # 基本边框/悬停样式 - 内部布局将处理文本居中
+        self.check_update_btn.setStyleSheet("""
+        PushButton {
+            border: 1px solid #d1d1d1;
+            border-radius: 8px;
+            background: transparent;
+        }
+        PushButton:hover {
+            background-color: rgba(0,0,0,0.03);
+        }
+        PushButton:pressed {
+            background-color: rgba(0,0,0,0.06);
+        }
+        """)
 
-        # 添加垂直方向的弹性空间，使按钮在卡片内垂直居中
-        update_layout.addStretch(1)  # 顶部弹性空间
-        update_layout.addWidget(self.check_update_btn, 0, Qt.AlignVCenter)  # 垂直居中
-        update_layout.addStretch(1)  # 底部弹性空间
+        # 按钮内部布局以保持文本居中
+        btn_inner_layout = QHBoxLayout(self.check_update_btn)
+        btn_inner_layout.setContentsMargins(8, 0, 8, 0)
+        btn_inner_layout.setSpacing(8)
 
-        # 软件版本改为 3.3.3
+        btn_inner_layout.addStretch(1)
+
+        # 文本标签（无图标）
+        self.check_update_text = QLabel("检查更新", self.check_update_btn)
+        self.check_update_text.setStyleSheet(f"font-weight: bold; font-family: '{self.font_family}'; color: {text_color_initial};")
+        btn_inner_layout.addWidget(self.check_update_text, 0, Qt.AlignVCenter)
+
+        btn_inner_layout.addStretch(1)
+        # ========================================================================================
+
+        update_layout.addStretch(1)
+        update_layout.addWidget(self.check_update_btn, 0, Qt.AlignVCenter)
+        update_layout.addStretch(1)
+
         self.update_check_card = CustomSettingCard(
             FluentIcon.UPDATE,
             "版本信息",
-            f"© 版权所有 2025, mc_xinyu. 当前版本 {self.parent_window.settings.version}",  # 使用动态版本
+            f"© 版权所有 2025, mc_xinyu. 当前版本 {self.parent_window.settings.version}",
             update_widget,
             self,
             self.font_family
         )
         layout.addWidget(self.update_check_card)
 
-        # 设置操作卡片 - 添加图标，保持原有布局
+        # 相关链接
+        links_widget = QWidget()
+        links_layout = QHBoxLayout(links_widget)
+        links_layout.setContentsMargins(0, 0, 0, 0)
+        links_layout.setSpacing(15)
+
+        # B站按钮
+        self.bilibili_btn = PushButton(self)
+        self.bilibili_btn.setText("Bilibili主页")
+        self.bilibili_btn.setFixedSize(160, 40)
+        self.bilibili_btn.clicked.connect(lambda: webbrowser.open("https://space.bilibili.com/3546594301446265"))
+        try:
+            if os.path.exists("assets/Bilibili_icon.svg"):
+                bilibili_icon = QIcon("assets/Bilibili_icon.svg")
+                self.bilibili_btn.setIcon(bilibili_icon)
+                self.bilibili_btn.setIconSize(QSize(20, 20))
+        except Exception:
+            pass
+
+        # 修复B站按钮样式（使用PushButton选择器并留出图标空间）
+        self.bilibili_btn.setStyleSheet("""
+        PushButton {
+            border: none;
+            border-radius: 8px;
+            padding: 8px 12px 8px 32px;
+            font-weight: bold;
+            text-align: left;
+        }
+        PushButton:hover {
+        }
+        PushButton:pressed {
+        }
+        """)
+
+        # GitHub按钮（统一样式，黑底白字）
+        self.github_btn = PushButton(self)
+        self.github_btn.setText("GitHub项目")
+        self.github_btn.setIcon(FluentIcon.GITHUB)
+        self.github_btn.setFixedSize(160, 40)
+        self.github_btn.setIconSize(QSize(20, 20))
+        self.github_btn.clicked.connect(lambda: webbrowser.open("https://github.com/mc-xinyu/QuantumRollCall"))
+        self.github_btn.setStyleSheet("""
+            PushButton {
+                background-color: #000000;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 12px 8px 32px;
+                font-weight: bold;
+                text-align: left;
+            }
+            PushButton:hover {
+                background-color: #333333;
+                color: #FFFFFF;
+            }
+            PushButton:pressed {
+                background-color: #666666;
+                color: #FFFFFF;
+            }
+        """)
+
+        links_layout.addStretch(1)
+        links_layout.addWidget(self.bilibili_btn)
+        links_layout.addWidget(self.github_btn)
+        links_layout.addStretch(1)
+
+        self.links_card = CustomSettingCard(
+            FluentIcon.SHARE,
+            "相关链接",
+            "访问我们的Bilibili主页和GitHub项目",
+            links_widget,
+            self,
+            self.font_family
+        )
+        layout.addWidget(self.links_card)
+
         settings_operation_widget = QWidget()
         settings_operation_layout = QHBoxLayout(settings_operation_widget)
         settings_operation_layout.setContentsMargins(0, 0, 0, 0)
@@ -1559,7 +1779,6 @@ class SettingsInterface(ScrollArea):
 
         self.export_settings_btn.clicked.connect(self.parent_window.export_settings)
         self.import_settings_btn.clicked.connect(self.parent_window.import_settings)
-        # connect to local handler which will show confirmation overlay
         self.reset_settings_btn.clicked.connect(self.on_reset_settings_clicked)
 
         settings_operation_layout.addWidget(self.export_settings_btn)
@@ -1579,29 +1798,28 @@ class SettingsInterface(ScrollArea):
         layout.addStretch(1)
 
         self.setWidget(container)
-
-        # 刷新显示
         self.refresh_settings()
         self.refresh_name_list()
         self.update_theme_style()
 
+    def on_timer_notification_changed(self, is_checked):
+        """倒计时通知设置变更处理"""
+        self.settings.show_timer_notification = is_checked
+        self.parent_window.save_settings()
+
     def load_logo(self):
-        """延迟加载 about 卡片的 logo（避免阻塞启动）"""
+        """加载Logo图片"""
         try:
             if os.path.exists("assets/logo.png"):
                 logo_pixmap = QPixmap("assets/logo.png")
                 logo_pixmap = logo_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.logo_label.setPixmap(logo_pixmap)
-            else:
-                pass
         except Exception:
             pass
 
     def update_theme_style(self):
-        """更新设置界面主题样式"""
+        """更新主题样式"""
         is_dark = isDarkTheme()
-
-        # 设置滚动区域背景和主容器背景
         container_bg = 'rgb(32, 32, 32)' if is_dark else 'rgb(243, 243, 243)'
         scroll_bg = container_bg
 
@@ -1615,19 +1833,13 @@ class SettingsInterface(ScrollArea):
             }}
         """)
 
-        # 主题色（用于复选框等控件）：暗色模式 #6c8fff，亮色模式 #4a6bff
-        # 这里也用于"检查更新"按钮的背景色，满足你的要求
         section_color = "#6c8fff" if is_dark else "#4a6bff"
-        # 设置全局主题色，方便 qfluentwidgets 的控件使用主色
         setThemeColor(QColor(section_color))
 
-        # 更新容器背景和文字样式 - 使用更具体的选择器，
-        # 并确保 CardWidget 内的文本（QLabel/BodyLabel/CaptionLabel）是透明背景
         container_style = f"""
             QWidget#settings_container {{
                 background-color: {container_bg};
             }}
-            /* 确保所有文字控件透明背景，避免出现方框 */
             CardWidget QLabel, CardWidget BodyLabel, CardWidget TitleLabel, CardWidget CaptionLabel, QLabel, BodyLabel, TitleLabel, CaptionLabel {{
                 background: transparent;
                 border: none;
@@ -1653,13 +1865,10 @@ class SettingsInterface(ScrollArea):
                 border-radius: 8px;
             }}
         """
-        # 应用样式到容器（setWidget 的 widget）
         if self.widget():
             self.widget().setStyleSheet(container_style)
 
-        # 更新标题颜色
         title_color = "white" if is_dark else "black"
-
         self.title_label.setStyleSheet(f"""
             TitleLabel {{
                 font-family: '{self.font_family}';
@@ -1669,7 +1878,6 @@ class SettingsInterface(ScrollArea):
             }}
         """)
 
-        # 更新分组标题颜色
         section_labels = [self.general_label, self.appearance_label, self.name_label, self.about_label]
         for label in section_labels:
             label.setStyleSheet(f"""
@@ -1685,180 +1893,108 @@ class SettingsInterface(ScrollArea):
                 }}
             """)
 
-        # Ensure the name list items reflect the new theme color
-        # (call refresh_name_list to update per-item label color)
         self.refresh_name_list()
 
-        # 为"检查更新"按钮应用主题色（背景色），文本颜色采用黑色以便与亮色背景对比
-        if hasattr(self, 'check_update_btn') and self.check_update_btn:
-            # 使用更明确的样式以覆盖之前的透明样式
-            # 文本颜色可根据需要改为白色以提升可读性；此处保留黑色以匹配示例截图
-            self.check_update_btn.setStyleSheet(f"""
-                PushButton {{
-                    background-color: {section_color};
-                    color: #000000;
-                    border: none;
-                    border-radius: 8px;
-                    padding: 6px 12px;
-                    font-weight: bold;
-                }}
-                PushButton:hover {{
-                    background-color: {section_color}cc;
-                }}
-                PushButton:pressed {{
-                    background-color: {section_color}99;
-                }}
-            """)
+        # 更新检查更新文本颜色（图标已移除）
+        if hasattr(self, 'check_update_text') and self.check_update_text:
+            text_color = "white" if is_dark else "black"
+            self.check_update_text.setStyleSheet(f"font-weight: bold; font-family: '{self.font_family}'; color: {text_color};")
 
     def on_auto_save_changed(self, is_checked):
-        """自动保存设置改变"""
+        """自动保存设置变更处理"""
         self.settings.auto_save = is_checked
-        # 自动保存设置改变时立即保存设置
         self.parent_window.save_settings()
 
     def on_avoid_repetition_changed(self, is_checked):
-        """避免重复设置改变"""
+        """避免重复点名设置变更处理"""
         self.settings.avoid_repetition = is_checked
-        # 避免重复设置改变时立即保存设置
         self.parent_window.save_settings()
 
     def on_check_update_on_startup_changed(self, is_checked):
-        """启动时检查更新设置改变"""
+        """启动时检查更新设置变更处理"""
         self.settings.check_update_on_startup = is_checked
-        # 启动时检查更新设置改变时立即保存设置
         self.parent_window.save_settings()
 
     def on_theme_changed(self, theme_text):
-        """主题设置改变"""
+        """主题设置变更处理"""
         theme_map = {
             "跟随系统": Theme.AUTO,
             "浅色": Theme.LIGHT,
             "深色": Theme.DARK
         }
         self.settings.theme = theme_map.get(theme_text, Theme.AUTO)
-        # 立即应用主题并更新界面
         self.parent_window.apply_settings()
-        # 主题设置改变时立即保存设置
         self.parent_window.save_settings()
 
     def add_name(self):
-        """添加名字"""
+        """添加名字到名单"""
         name = self.name_input.text().strip()
         if name:
             if self.parent_window.add_name_to_list(name):
                 self.name_input.clear()
 
     def on_clear_names_clicked(self):
-        """点击'清空名单'时使用内置对话框"""
+        """清空名单确认"""
         if not self.parent_window:
             return
-
         title = '确认清空名单'
         content = '是否确认清空名单？此操作不可撤销。'
-        
-        # 使用简单的 MessageBox，确保父窗口正确
         w = MessageBox(title, content, self.window())
-        
-        # 修改按钮文字为中文
         w.yesButton.setText('确定')
         w.cancelButton.setText('取消')
-        
         if w.exec():
-            # 用户点击了确定
             self.parent_window.clear_name_list()
 
     def on_reset_settings_clicked(self):
-        """点击'重置设置'时使用内置对话框"""
+        """重置设置确认"""
         if not self.parent_window:
             return
-
         title = '确认重置设置'
         content = '是否确认重置所有设置为默认值？此操作不可撤销。'
-        
-        # 使用简单的 MessageBox，确保父窗口正确
         w = MessageBox(title, content, self.window())
-        
-        # 修改按钮文字为中文
         w.yesButton.setText('确定')
         w.cancelButton.setText('取消')
-        
         if w.exec():
-            # 用户点击了确定
             self.parent_window.reset_settings()
 
-    def remove_selected_name(self):
-        """已废弃：原来的删除选中功能不再用于 UI"""
-        current_item = self.name_list.currentItem()
-        if current_item:
-            # 这里保留旧逻辑但不再调用本地刷新（主窗口会刷新）
-            widget = self.name_list.itemWidget(current_item)
-            if widget:
-                # 尝试从 item widget 中找 label 文本
-                label = widget.findChild(QLabel)
-                if label:
-                    name = label.text()
-                    if self.parent_window.remove_name_from_list(name):
-                        pass
-
     def refresh_name_list(self):
-        """刷新名单列表"""
-        # 禁止中间更新以减少绘制开销
+        """刷新名单列表显示"""
         self.name_list.setUpdatesEnabled(False)
         self.name_list.blockSignals(True)
-
-        # 保存当前滚动值（绝对值），稍后尽量恢复它
         scrollbar = self.name_list.verticalScrollBar()
         old_value = scrollbar.value() if scrollbar else 0
-
         self.name_list.clear()
-
-        # Determine text color based on current theme
         text_color = "white" if isDarkTheme() else "black"
-
-        # 确保使用与点名界面相同的名单管理器实例
         for name in self.parent_window.name_manager.names:
-            # Create a custom widget for each list item with a delete button
             item = QListWidgetItem()
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
             row_layout.setContentsMargins(8, 4, 8, 4)
             row_layout.setSpacing(10)
-
             name_label = QLabel(name)
-            # include color so it follows theme changes
             name_label.setStyleSheet(f"QLabel {{ font-family: '{self.font_family}'; color: {text_color}; background: transparent; border: none; }}")
             row_layout.addWidget(name_label)
             row_layout.addStretch(1)
-
             delete_btn = PushButton(FluentIcon.DELETE, "删除", self)
             delete_btn.setFixedHeight(28)
             delete_btn.setFixedWidth(80)
-            # bind the current name to the slot to avoid late-binding issue
             delete_btn.clicked.connect(lambda _, n=name: self.on_delete_name_clicked(n))
             row_layout.addWidget(delete_btn)
-
             item.setSizeHint(row_widget.sizeHint())
             self.name_list.addItem(item)
             self.name_list.setItemWidget(item, row_widget)
-
-        # 计算应恢复的滚动值：尽量保持原来的位置，超出范围时使用新的最大值
         if scrollbar:
             new_max = scrollbar.maximum()
             new_value = max(0, min(old_value, new_max))
-            # 将恢复操作放到下一轮事件循环，确保布局/maximum 已稳定
             QTimer.singleShot(0, lambda val=new_value, sb=scrollbar: sb.setValue(val))
-
-        # 恢复更新和信号
         self.name_list.blockSignals(False)
         self.name_list.setUpdatesEnabled(True)
 
     def on_delete_name_clicked(self, name):
-        """处理单个名字的删除请求"""
+        """删除名字处理"""
         if not name:
             return
-        # 仅调用主窗口的删除接口；主窗口会负责刷新界面和保存（已优化为异步保存）
         if self.parent_window:
-            # 单条删除不再显示确认遮罩（只对清空/重置做确认）
             self.parent_window.remove_name_from_list(name)
 
     def refresh_settings(self):
@@ -1866,7 +2002,8 @@ class SettingsInterface(ScrollArea):
         self.auto_save_card.switch.setChecked(self.settings.auto_save)
         self.avoid_repetition_card.switch.setChecked(self.settings.avoid_repetition)
         self.check_update_card.switch.setChecked(self.settings.check_update_on_startup)
-
+        # 新增：刷新倒计时通知设置
+        self.timer_notification_card.switch.setChecked(self.settings.show_timer_notification)
         theme_map = {
             Theme.AUTO: "跟随系统",
             Theme.LIGHT: "浅色",
@@ -1875,7 +2012,7 @@ class SettingsInterface(ScrollArea):
         self.theme_combo.setCurrentText(theme_map.get(self.settings.theme, "跟随系统"))
 
     def on_check_updates_clicked(self):
-        """检查更新按钮逻辑 - 从GitHub获取最新版本信息"""
+        """手动检查更新"""
         self._check_updates(silent=False)
 
     def silent_check_updates_on_startup(self):
@@ -1885,42 +2022,30 @@ class SettingsInterface(ScrollArea):
     def _check_updates(self, silent=False):
         """检查更新核心逻辑"""
         try:
-            # 从指定URL获取最新版本信息
             url = "https://ghproxy.net/https://raw.githubusercontent.com/mc-xinyu/QuantumRollCallUpdate/main/version.txt"
             with urllib.request.urlopen(url, timeout=10) as response:
                 content = response.read().decode('utf-8').strip()
                 lines = content.split('\n')
-                
                 if len(lines) >= 2:
                     latest_version = lines[0].strip()
                     download_url = lines[1].strip()
-                    
                     current_version = self.parent_window.settings.version
-                    
-                    if latest_version != current_version:
+                    if latest_version > current_version:
                         if not silent:
-                            # 显示更新对话框
                             title = "检查更新"
                             content = f"发现新版本 {latest_version}，是否立即更新？"
-                            
                             w = MessageBox(title, content, self.window())
                             w.yesButton.setText('确定')
                             w.cancelButton.setText('取消')
-                            
                             if w.exec():
-                                # 用户点击确定，下载更新包
                                 self.start_download_update(latest_version, download_url)
                         else:
-                            # 启动静默检查时，发现新版本则弹出对话框（和手动一样）
                             title = "检查更新"
                             content = f"发现新版本 {latest_version}，是否立即更新？"
-                            
                             w = MessageBox(title, content, self.window())
                             w.yesButton.setText('确定')
                             w.cancelButton.setText('取消')
-                            
                             if w.exec():
-                                # 用户点击确定，下载更新包
                                 self.start_download_update(latest_version, download_url)
                     else:
                         if not silent:
@@ -1933,13 +2058,10 @@ class SettingsInterface(ScrollArea):
                                 duration=2000,
                                 parent=self
                             )
-                        # silent: do nothing
                 else:
                     raise ValueError("无法检查更新")
-                    
         except Exception as e:
             if not silent:
-                print(f"检查更新失败: {e}")
                 InfoBar.error(
                     title="检查更新",
                     content="无法连接至更新服务器，请检查网络连接",
@@ -1949,11 +2071,9 @@ class SettingsInterface(ScrollArea):
                     duration=3000,
                     parent=self
                 )
-            # silent: do nothing
 
     def start_download_update(self, version, url):
-        """开始下载更新（使用线程避免界面卡死）"""
-        # 创建下载进度消息条
+        """开始下载更新"""
         self.download_info_bar = InfoBar(
             icon=InfoBarIcon.INFORMATION,
             title="更新",
@@ -1961,12 +2081,10 @@ class SettingsInterface(ScrollArea):
             orient=Qt.Horizontal,
             isClosable=False,
             position=InfoBarPosition.TOP,
-            duration=-1,  # 永久显示
+            duration=-1,
             parent=self
         )
         self.download_info_bar.show()
-        
-        # 在线程中执行下载
         download_thread = threading.Thread(
             target=self.download_update_thread,
             args=(version, url)
@@ -1975,51 +2093,33 @@ class SettingsInterface(ScrollArea):
         download_thread.start()
 
     def download_update_thread(self, version, url):
-        """下载更新的线程函数"""
+        """下载更新线程"""
         try:
-            # 创建downloads目录
             downloads_dir = "downloads"
             os.makedirs(downloads_dir, exist_ok=True)
-            
-            # 下载文件
             filename = os.path.join(downloads_dir, f"{version}.zip")
-            
             def update_progress(block_num, block_size, total_size):
-                """更新下载进度"""
                 if total_size > 0:
                     downloaded = block_num * block_size
                     self.download_signals.progress_updated.emit(downloaded, total_size)
-            
-            # 下载文件
             urllib.request.urlretrieve(url, filename, update_progress)
-            
-            # 解压文件到 downloads/update 目录
             extract_path = os.path.join(downloads_dir, "update")
             os.makedirs(extract_path, exist_ok=True)
-            
             with zipfile.ZipFile(filename, 'r') as zip_ref:
-                # 获取压缩包中根目录的所有文件和文件夹
                 for file_info in zip_ref.infolist():
-                    # 提取根目录下的文件和文件夹（不包含子目录中的内容）
                     if '/' not in file_info.filename or file_info.filename.count('/') == 1:
-                        # 如果是根目录的文件或一级子目录
                         zip_ref.extract(file_info, extract_path)
-            
-            # 下载完成
             self.download_signals.download_finished.emit()
-            
         except Exception as e:
             error_msg = f"下载更新失败: {str(e)}"
             self.download_signals.error_occurred.emit(error_msg)
 
     def on_download_progress(self, downloaded, total_size):
-        """更新下载进度"""
+        """下载进度更新"""
         if total_size > 0:
             progress = int(downloaded * 100 / total_size)
             if self.download_info_bar:
                 self.download_info_bar.setContent(f"下载进度: {progress}%")
-                
-            # 如果下载完成
             if downloaded >= total_size:
                 if self.download_info_bar:
                     self.download_info_bar.setContent("下载完成，正在解压...")
@@ -2029,17 +2129,12 @@ class SettingsInterface(ScrollArea):
         if self.download_info_bar:
             self.download_info_bar.close()
             self.download_info_bar = None
-        
-        # 查找并运行程序根目录的 Update.exe
         current_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         update_exe_path = os.path.join(current_dir, "Update.exe")
-        
         if os.path.exists(update_exe_path):
             try:
                 import subprocess
                 subprocess.Popen([update_exe_path])
-                
-                # 静默关闭程序，不显示任何消息条
                 QTimer.singleShot(500, QApplication.quit)
             except Exception as e:
                 InfoBar.error(
@@ -2063,12 +2158,10 @@ class SettingsInterface(ScrollArea):
             )
 
     def on_download_error(self, error_msg):
-        """错误处理"""
-        print(error_msg)
+        """下载错误处理"""
         if self.download_info_bar:
             self.download_info_bar.close()
             self.download_info_bar = None
-            
         InfoBar.error(
             title="更新",
             content="无法下载更新文件，请检查网络连接",
@@ -2099,7 +2192,7 @@ if __name__ == '__main__':
     except Exception:
         pass
 
-    # 仅使用 assets/icon.ico 作为应用图标（若不存在则不设置）
+    # 仅使用assets/icon.ico作为应用图标（若不存在则不设置）
     try:
         ico_path = "assets/icon.ico"
         if os.path.exists(ico_path):
